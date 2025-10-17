@@ -1,0 +1,11 @@
+🧠 Projet : Sentiment Analysis & Portfolio Selection
+
+1. Récupération des news : 
+- NewsAPI 
+- GDELT
+
+Train sequences (7216, 10, 4) : tu as 7 216 séquences d’entraînement, chaque séquence = 10 jours × 4 features (sentiment, prix norm., log(volume), retour).
+Test sequences (99, 10, 4) : 99 séquences pour la fenêtre test (06-09 → 05-10-2025).
+MSE train ≈ 0.00046 : erreur moyenne au carré sur les retours; c’est faible → bon fit.
+[Test] MSE = 0.00022736 : l’erreur sur la période test. Ça veut dire que tes prédictions de retour_{t+1} sont raisonnables.
+Tu as maintenant gru_preds_test.csv avec, pour chaque (date, ticker), y_true_return_t1 (vrai) et y_pred_return_t1 (prévu) → c’est ta vue pour demain.
