@@ -1,19 +1,19 @@
-# -*- coding: utf-8 -*-
 """
-06_bl_portofolios.py
-Black–Litterman (Q = prédictions du modèle choisi) vs Equal-Weight vs Sentiment-only
+06_bl_portfolios.py
+Black–Litterman (Q = LSTM predictions) vs Equal-Weight vs Sentiment-only
 
-Fichiers utilisés (conformes à ta capture):
+Inputs:
 - prices_long.csv
-- prediction_gru.csv / prediction_lstm.csv / prediction_rnn.csv
-- prediction_summary_metrics.csv (optionnel pour auto-pick)
-- sentiment_daily.csv (optionnel)
-- risk_free_IRX.csv (optionnel, non nécessaire)
+- prediction_lstm.csv
+- daily_sentiment.csv
+- risk_free_IRX.csv  (optional; improves Sharpe/Sortino via excess returns)
 
-Sorties:
-- weights_{MODEL}.csv
-- bt_{MODEL}.csv
-- outputs/nav_compare_{MODEL}.png
+Outputs:
+- weights_LSTM.csv
+- bt_LSTM.csv
+- outputs/nav_compare_LSTM.png
+- outputs/corr_matrix_LSTM.png
+- outputs/metrics_bt_LSTM.csv
 """
 
 import os
@@ -23,45 +23,38 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # =============== CONFIG ===============
-MODEL = "GRU"   # "GRU" | "LSTM" | "RNN"
-AUTO_PICK_BEST = True  # True: lit prediction_summary_metrics.csv et choisit le meilleur modèle
-
+MODEL = "LSTM"
 PRICES_CSV = "prices_long.csv"
-PREDS_BY_MODEL = {
-    "GRU":  "prediction_gru.csv",
-    "LSTM": "prediction_lstm.csv",
-    "RNN":  "prediction_rnn.csv",
-}
-SENT_CSV_OPT = "sentiment_daily.csv"  # optionnel
-METRICS_SUMMARY = "prediction_summary_metrics.csv"  # optionnel (pour AUTO_PICK_BEST)
+PREDS_FILE = "prediction_lstm.csv"
+SENT_CSV = "daily_sentiment.csv"
+RISKFREE_CSV = "risk_free_IRX.csv"   # optional
 
-# Hyperparamètres BL
-LAM = 1.0   # échelle du prior
-TAU = 0.05  # incertitude sur Sigma
-K   = 0.5   # incertitude des vues (plus grand => moins confiant dans Q)
+LAM = 1.0   # prior risk aversion
+TAU = 0.05  # prior uncertainty
+K   = 0.5   # view uncertainty
 
 OUTDIR = "outputs"
 os.makedirs(OUTDIR, exist_ok=True)
 
 # =============== UTILS ===============
-def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_cols(df):
     df = df.copy()
     df.columns = [c.lower() for c in df.columns]
     return df
 
-def get_price_col(df: pd.DataFrame) -> str:
+def get_price_col(df):
     for c in ["adj_close", "close", "price", "px", "last", "value"]:
         if c in df.columns:
             return c
-    raise KeyError("Colonne prix non trouvée (attendu: adj_close/close/price/px/last/value).")
+    raise KeyError("No price column found (expected adj_close/close/price/px/last/value).")
 
-def get_pred_col(df: pd.DataFrame) -> str:
+def get_pred_col(df):
     for c in ["y_pred_return_t1", "ret_pred", "pred", "y_pred", "return_pred", "ret"]:
         if c in df.columns:
             return c
-    raise KeyError("Colonne de retour prédit non trouvée (ex: y_pred_return_t1/ret_pred/pred).")
+    raise KeyError("No predicted return column found (e.g., y_pred_return_t1/ret_pred/pred).")
 
-def mv_weights_from_mu(Sigma: np.ndarray, mu: np.ndarray, long_only: bool = True) -> np.ndarray:
+def mv_weights_from_mu(Sigma, mu, long_only=True):
     Sig = Sigma + 1e-6 * np.eye(Sigma.shape[0])
     try:
         w = np.linalg.solve(Sig, mu)
@@ -72,122 +65,90 @@ def mv_weights_from_mu(Sigma: np.ndarray, mu: np.ndarray, long_only: bool = True
     s = w.sum()
     return (np.ones_like(w) / len(w)) if s <= 0 else (w / s)
 
-def bl_posterior_mu(Sigma: np.ndarray, pi: np.ndarray, Q: np.ndarray, tau: float, Omega_inv: np.ndarray) -> np.ndarray:
+def bl_posterior_mu(Sigma, pi, Q, tau, Omega_inv):
     A = np.linalg.inv(tau * Sigma) + Omega_inv
     b = np.linalg.inv(tau * Sigma) @ pi + Omega_inv @ Q
     return np.linalg.solve(A, b)
 
-def Omega_inv_from(S_sub: np.ndarray) -> np.ndarray:
+def Omega_inv_from(S_sub):
     diag = K * np.diag(TAU * S_sub) + 1e-8
     return np.diag(1.0 / diag)
 
-def choose_best_model(default_model: str) -> str:
-    if not AUTO_PICK_BEST or not Path(METRICS_SUMMARY).exists():
-        return default_model
-    df = pd.read_csv(METRICS_SUMMARY)
-    # colonnes possibles : Model, Sharpe, Sortino, CAGR, etc.
-    cols = [c.lower() for c in df.columns]
-    # normalise
-    df.columns = cols
-    # priorité Sharpe, sinon CAGR, sinon garde défaut
-    key = "sharpe" if "sharpe" in cols else ("cagr" if "cagr" in cols else None)
-    if key is None:
-        return default_model
-    df = df.sort_values(key, ascending=False)
-    candidate = str(df.iloc[0]["model"]).upper() if "model" in cols else default_model
-    candidate = candidate if candidate in {"GRU","LSTM","RNN"} else default_model
-    return candidate
-
-# =============== 1) LECTURE ===============
-# modèle choisi
-MODEL = choose_best_model(MODEL)
-preds_file = PREDS_BY_MODEL[MODEL]
-if not Path(preds_file).exists():
-    # fallback: prend le 1er fichier existant
-    for m, f in PREDS_BY_MODEL.items():
-        if Path(f).exists():
-            MODEL = m
-            preds_file = f
-            break
-if not Path(preds_file).exists():
-    raise FileNotFoundError(f"Aucun fichier de prédiction trouvé parmi: {list(PREDS_BY_MODEL.values())}")
-
-# PRIX
-if not Path(PRICES_CSV).exists():
-    raise FileNotFoundError(f"Introuvable: {PRICES_CSV}")
+# =============== 1) LOAD DATA ===============
 prices = pd.read_csv(PRICES_CSV, parse_dates=["date"])
+preds  = pd.read_csv(PREDS_FILE,  parse_dates=["date"])
+sent   = pd.read_csv(SENT_CSV,    parse_dates=["date"])
+
 prices = normalize_cols(prices)
+preds  = normalize_cols(preds)
+sent   = normalize_cols(sent)
+
 prices["date"] = prices["date"].dt.date
+preds["date"]  = preds["date"].dt.date
+sent["date"]   = sent["date"].dt.date
+
 prices["ticker"] = prices["ticker"].astype(str).str.upper()
+preds["ticker"]  = preds["ticker"].astype(str).str.upper()
+sent["ticker"]   = sent["ticker"].astype(str).str.upper()
+
 price_col = get_price_col(prices)
+pred_col  = get_pred_col(preds)
 
-# PREDS (modèle)
-preds = pd.read_csv(preds_file, parse_dates=["date"])
-preds = normalize_cols(preds)
-preds["date"] = preds["date"].dt.date
-preds["ticker"] = preds["ticker"].astype(str).str.upper()
-pred_col = get_pred_col(preds)
+# Optional: risk-free daily series aligned by date (for excess returns in metrics)
+rf_series = None
+if Path(RISKFREE_CSV).exists():
+    rf = pd.read_csv(RISKFREE_CSV, parse_dates=["date"])
+    rf = normalize_cols(rf)
+    rf["date"] = rf["date"].dt.date
+    # convert annual % to daily decimal (252 trading days)
+    rf["rf_daily"] = rf["irx_adj_close"] / 100.0 / 252.0
+    rf_series = rf.set_index("date")["rf_daily"]
+    print(f"✅ Risk-free loaded ({len(rf_series)} rows)")
+else:
+    print("ℹ️ risk_free_IRX.csv not found → metrics will use rf=0.")
 
-# SENTIMENT (optionnel)
-sent_df = None
-if Path("sentiment_daily.csv").exists():
-    s = pd.read_csv("sentiment_daily.csv", parse_dates=["date"])
-    s = normalize_cols(s)
-    if "ticker" in s.columns and "date" in s.columns:
-        s["date"] = s["date"].dt.date
-        s["ticker"] = s["ticker"].astype(str).str.upper()
-        if "sentiment_mean" in s.columns:
-            s_col = "sentiment_mean"
-        elif "sentiment" in s.columns:
-            s_col = "sentiment"
-        else:
-            s_col = None
-        if s_col is not None:
-            sent_df = s[["date","ticker",s_col]].rename(columns={s_col:"sent"}).copy()
-
-# TICKERS communs prix/prédictions
-tickers_prices = set(prices["ticker"].unique())
-tickers_preds  = set(preds["ticker"].unique())
-tickers_all = sorted(tickers_prices & tickers_preds)
-if len(tickers_all) == 0:
-    raise RuntimeError("Aucun ticker commun entre prices_long.csv et le fichier de prédictions.")
-
-# Fenêtre test = fenêtre prédictions
+# =============== 2) COVARIANCE (TRAIN) & PRIOR ===============
 dmin_te, dmax_te = preds["date"].min(), preds["date"].max()
 
-# =============== 2) COVARIANCE TRAIN & PRIOR ===============
 ret_all = (
     prices.sort_values(["ticker","date"])
-          .assign(ret=lambda d: d.groupby("ticker", observed=True)[price_col].pct_change())
+          .assign(ret=lambda d: d.groupby("ticker")[price_col].pct_change())
 )
-ret_train = ret_all[ret_all["date"] < dmin_te]
 
-R = ret_train.pivot(index="date", columns="ticker", values="ret").fillna(0.0)
-R = R[[c for c in tickers_all if c in R.columns]]
-assets = list(R.columns); N = len(assets)
-if N == 0:
-    raise RuntimeError("Pas d'actifs pour Sigma (check prices_long.csv / prédictions).")
+ret_train = ret_all[ret_all["date"] < dmin_te]
+tickers_common = sorted(set(prices["ticker"]) & set(preds["ticker"]))
+R = ret_train.pivot(index="date", columns="ticker", values="ret")
+R = R[tickers_common].fillna(0.0)
 
 Sigma = R.cov().values
-w_mkt = np.ones(N)/N
+w_mkt = np.ones(len(tickers_common)) / len(tickers_common)
 pi = LAM * Sigma.dot(w_mkt)
 
-# =============== 3) POIDS JOURNALIERS (BL / EW / Sentiment) ===============
+# --- correlation heatmap (clear) ---
+corr = R.corr()
+plt.figure(figsize=(8, 6))
+plt.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1)
+plt.colorbar(label="Correlation")
+plt.xticks(range(len(tickers_common)), tickers_common, rotation=90)
+plt.yticks(range(len(tickers_common)), tickers_common)
+plt.title("Correlation matrix between assets (train window)")
+plt.tight_layout()
+corr_png = os.path.join(OUTDIR, f"corr_matrix_{MODEL}.png")
+plt.savefig(corr_png, dpi=150)
+plt.close()
+print(f"✅ Saved correlation heatmap → {corr_png}")
+
+# =============== 3) DAILY WEIGHTS (BL / EW / Sentiment) ===============
 rows = []
-preds_use = preds[["date","ticker",pred_col]].copy()
-
-for d, g in preds_use.groupby("date", sort=True):
+for d, g in preds.groupby("date", sort=True):
     tkrs = list(g["ticker"].unique())
-    idx = [assets.index(t) for t in tkrs if t in assets]
-    tkrs = [assets[i] for i in idx]
-    if len(idx) == 0:
+    tkrs = [t for t in tkrs if t in tickers_common]
+    if not tkrs:
         continue
-
+    idx = [tickers_common.index(t) for t in tkrs]
     S_d  = Sigma[np.ix_(idx, idx)]
     pi_d = pi[idx]
-
-    g_unique = g.drop_duplicates("ticker").set_index("ticker")
-    Q_d = g_unique[pred_col].reindex(tkrs).fillna(0.0).values.astype(float)
+    Q_d  = g.set_index("ticker")[pred_col].reindex(tkrs).fillna(0.0).values.astype(float)
 
     Omega_inv_d = Omega_inv_from(S_d)
     mu_star = bl_posterior_mu(S_d, pi_d, Q_d, TAU, Omega_inv_d)
@@ -195,37 +156,34 @@ for d, g in preds_use.groupby("date", sort=True):
     w_bl = mv_weights_from_mu(S_d, mu_star, long_only=True)
     w_ew = np.ones(len(tkrs)) / len(tkrs)
 
-    if sent_df is not None:
-        s_today = (
-            sent_df[sent_df["date"]==d]
-            .drop_duplicates("ticker")
-            .set_index("ticker")["sent"]
-            .reindex(tkrs).fillna(0.0).values.astype(float)
-        )
-        s_pos = np.clip(s_today, 0, None)
-    else:
-        s_pos = np.clip(Q_d, 0, None)
-    w_s = s_pos/s_pos.sum() if s_pos.sum()>0 else np.zeros_like(s_pos)
+    s_today = (
+        sent[sent["date"] == d]
+        .drop_duplicates("ticker")
+        .set_index("ticker")["sentiment_mean"]
+        .reindex(tkrs)
+        .fillna(0.0)
+        .values
+        .astype(float)
+    )
+    s_pos = np.clip(s_today, 0, None)
+    w_s = s_pos / s_pos.sum() if s_pos.sum() > 0 else np.zeros_like(s_pos)
 
     for t, w1, w2, w3 in zip(tkrs, w_bl, w_ew, w_s):
-        rows.append({"date": d, "ticker": t, "w_BL": float(w1), "w_EW": float(w2), "w_Sent": float(w3)})
+        rows.append({"date": d, "ticker": t, "w_BL": w1, "w_EW": w2, "w_Sent": w3})
 
-weights = pd.DataFrame(rows).sort_values(["date","ticker"])
+weights = pd.DataFrame(rows).sort_values(["date", "ticker"])
 weights_out = f"weights_{MODEL}.csv"
 weights.to_csv(weights_out, index=False)
-print(f"✅ Saved {weights_out} | rows: {len(weights)}")
+print(f"✅ Saved {weights_out} ({len(weights)} rows)")
 
-# =============== 4) MINI BACKTEST ===============
-ret_test = (
-    ret_all[(ret_all["date"]>=dmin_te) & (ret_all["date"]<=dmax_te)]
-    .pivot(index="date", columns="ticker", values="ret").fillna(0.0)
-)
+# =============== 4) BACKTEST (TEST WINDOW) ===============
+ret_test = ret_all[(ret_all["date"] >= dmin_te) & (ret_all["date"] <= dmax_te)]
+ret_test = ret_test.pivot(index="date", columns="ticker", values="ret").fillna(0.0)
 
 def run_bt(col):
     W = weights.pivot(index="date", columns="ticker", values=col).reindex(ret_test.index).fillna(0.0)
     common = [c for c in W.columns if c in ret_test.columns]
-    W = W[common]; R = ret_test[common]
-    return (W*R).sum(axis=1)
+    return (W[common] * ret_test[common]).sum(axis=1)
 
 bt = pd.DataFrame({
     "ret_BL":   run_bt("w_BL"),
@@ -234,20 +192,67 @@ bt = pd.DataFrame({
 }).fillna(0.0)
 
 for c in bt.columns:
-    bt["cum_"+c.split("_")[1]] = (1.0 + bt[c]).cumprod()
+    bt["cum_" + c.split("_")[1]] = (1.0 + bt[c]).cumprod()
 
 bt_out = f"bt_{MODEL}.csv"
 bt.to_csv(bt_out, index=True)
-print(f"✅ Saved {bt_out} | rows: {len(bt)}")
+print(f"✅ Saved {bt_out} ({len(bt)} rows)")
 
-# =============== 5) COURBE ===============
+# =============== 5) PERFORMANCE METRICS (with optional risk-free) ===============
+def compute_metrics(df, col, rf_daily_series=None):
+    r = df[col].copy()
+    if rf_daily_series is not None:
+        # align daily risk-free to df index; fill forward for missing dates
+        rf_aligned = pd.Series(rf_daily_series).reindex(df.index).fillna(method="ffill").fillna(0.0)
+        r = r - rf_aligned
+    mean = r.mean()
+    std = r.std()
+    downside = r[r < 0].std()
+    sharpe = mean / std if std > 0 else np.nan
+    sortino = mean / downside if downside > 0 else np.nan
+    cum = (1.0 + r).cumprod()
+    # CAGR on trading days (assume 252)
+    cagr = cum.iloc[-1] ** (252 / max(len(r),1)) - 1
+    roll_max = cum.cummax()
+    dd = (cum / roll_max) - 1.0
+    maxdd = dd.min()
+    return {
+        "CAGR": cagr,
+        "Sharpe": sharpe,
+        "Sortino": sortino,
+        "MaxDD": maxdd,
+        "Volatility": std,
+        "Days": len(r)
+    }
+
+rf_aligned = None
+if rf_series is not None:
+    # Convert bt.index (date) to Series index for alignment
+    rf_aligned = rf_series
+
+metrics = []
+for col in ["ret_BL", "ret_EW", "ret_Sent"]:
+    m = compute_metrics(bt, col, rf_daily_series=rf_aligned)
+    m["Portfolio"] = col.split("_")[1]
+    metrics.append(m)
+
+metrics_df = pd.DataFrame(metrics).set_index("Portfolio")
+metrics_out = os.path.join(OUTDIR, f"metrics_bt_{MODEL}.csv")
+metrics_df.to_csv(metrics_out)
+print(f"✅ Saved metrics table → {metrics_out}")
+print("\n=== PERFORMANCE METRICS (excess returns if rf available) ===")
+print(metrics_df.round(4))
+
+# =============== 6) PLOT NAVs (3 strategies) ===============
 plt.figure(figsize=(10,6))
-plt.plot(bt.index, bt["cum_BL"],   label=f"Black–Litterman ({MODEL})")
-plt.plot(bt.index, bt["cum_EW"],   label="Equal Weight")
-plt.plot(bt.index, bt["cum_Sent"], label="Sentiment-only")
-plt.title(f"Évolution du portefeuille ({MODEL})")
-plt.xlabel("Date"); plt.ylabel("Valeur cumulée")
-plt.legend(); plt.grid(True); plt.tight_layout()
+plt.plot(bt.index, bt["cum_BL"],   label=f"Black–Litterman ({MODEL})", linewidth=2)
+plt.plot(bt.index, bt["cum_EW"],   label="Equal Weight", linewidth=2)
+plt.plot(bt.index, bt["cum_Sent"], label="Sentiment-only", linewidth=2)
+plt.title(f"Portfolio NAVs Comparison ({MODEL})")
+plt.xlabel("Date"); plt.ylabel("Cumulative Value")
+plt.legend(); plt.grid(True, linestyle="--", alpha=0.7)
+plt.tight_layout()
 png_out = os.path.join(OUTDIR, f"nav_compare_{MODEL}.png")
 plt.savefig(png_out, dpi=150)
-print(f"✅ Courbe enregistrée → {png_out}")
+plt.close()
+print(f"✅ Saved NAV plot → {png_out}")

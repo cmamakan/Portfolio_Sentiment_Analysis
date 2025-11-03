@@ -14,7 +14,7 @@ Outputs:
 - prediction_rnn.csv, prediction_lstm.csv, prediction_gru.csv    → next-day return predictions (2025)
 - weights_RNN.csv, weights_LSTM.csv, weights_GRU.csv             → BL portfolio weights (by date, ticker)
 - bt_RNN.csv, bt_LSTM.csv, bt_GRU.csv                            → backtest returns & cumulative curves
-- recap_metrics_models.csv                                       → MSE, RMSE, MAE, R², MAPE%, Sharpe, Sortino, CAGR, MaxDD, Days
+- prediction_metrics_models.csv                                       → MSE, RMSE, MAE, R², MAPE%, Sharpe, Sortino, CAGR, MaxDD, Days
 
 Steps:
 1) Build features per ticker: returns, log(volume), next-day target.
